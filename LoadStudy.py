@@ -1,111 +1,129 @@
 import streamlit as st
 import pandas as pd
-from pymongo import MongoClient, UpdateOne
-from deepdiff import DeepDiff
 import hashlib
-import datetime
 import json
+from pymongo import MongoClient, UpdateOne
+from datetime import datetime
+from deepdiff import DeepDiff
 
-# --- Mongo Connection ---
+# --- MongoDB Connection ---
 client = MongoClient(st.secrets["MONGO_URI"])
 db = client["StudyDB"]
 collection = db["Studycollection"]
 
-# --- Utility Functions ---
-
+# --- Helpers ---
 def compute_hash(doc):
-    doc_str = json.dumps(doc, default=str, sort_keys=True)
+    doc_str = json.dumps(doc, sort_keys=True, default=str)
     return hashlib.md5(doc_str.encode()).hexdigest()
 
-def serialize_for_mongo(record):
-    for k, v in record.items():
-        if isinstance(v, pd.Timestamp):
-            record[k] = v.to_pydatetime()
-    return record
+def get_latest_versions():
+    pipeline = [
+        {"$sort": {"version": -1}},
+        {
+            "$group": {
+                "_id": "$StudyID",
+                "doc": {"$first": "$$ROOT"}
+            }
+        },
+        {"$replaceRoot": {"newRoot": "$doc"}}
+    ]
+    return list(collection.aggregate(pipeline))
 
-def load_existing_studies():
-    return {doc["StudyID"]: doc for doc in collection.find({}, {"_id": 0})}
+def save_version(doc):
+    version_doc = doc.copy()
+    version_doc.pop("_id", None)
+    collection.insert_one(version_doc)
 
-def rollback_study(study_id, version):
-    history_doc = collection.find_one({"StudyID": study_id, "version": version})
-    if history_doc:
-        collection.insert_one(history_doc)
-        st.success(f"Rolled back {study_id} to version {version}")
-    else:
-        st.error("Version not found for rollback.")
+def rollback_to_version(study_id, version):
+    target = collection.find_one({"StudyID": study_id, "version": version})
+    if target:
+        target.pop("_id", None)
+        new_version = max([d["version"] for d in collection.find({"StudyID": study_id})]) + 1
+        target["version"] = new_version
+        target["timestamp"] = datetime.utcnow()
+        target["hash"] = compute_hash(target)
+        target["diff"] = {}
+        target["diff_log"] = json.dumps({})
+        collection.insert_one(target)
+        st.success(f"Rolled back {study_id} to version {version} as version {new_version}.")
 
-# --- UI ---
+# --- Streamlit App ---
+st.title("📊 Study Loader with Version Control")
 
-st.title("📊 Study Loader & Version Manager")
+uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 
-uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx"])
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
-    st.write("Preview of Uploaded Data", df)
-
-    existing_studies = load_existing_studies()
-
-    updates = []
-    inserts = []
+    updates, inserts = [], []
     logs = []
 
     for _, row in df.iterrows():
-        study = row.to_dict()
-        study = serialize_for_mongo(study)
-        study_id = study.get("StudyID")
+        new_doc = row.dropna().to_dict()
 
-        if not study_id:
-            st.warning("Missing StudyID in row, skipping.")
-            continue
+        # Ensure datetime fields are converted
+        for k in ["StartDate", "EndDate"]:
+            if k in new_doc and not isinstance(new_doc[k], datetime):
+                new_doc[k] = pd.to_datetime(new_doc[k]).to_pydatetime()
 
-        new_hash = compute_hash(study)
+        new_doc["StudyID"] = str(new_doc["StudyID"]).strip()
+        existing_doc = collection.find_one({"StudyID": new_doc["StudyID"]}, sort=[("version", -1)])
 
-        if study_id in existing_studies:
-            old_doc = existing_studies[study_id]
-            old_hash = old_doc.get("hash")
+        if existing_doc:
+            version = existing_doc["version"] + 1
+            raw_diff = DeepDiff(existing_doc, new_doc, ignore_order=True)
+            clean_diff = json.loads(raw_diff.to_json())
+            diff_log = raw_diff.to_json()
 
-            if new_hash != old_hash:
-                version = old_doc.get("version", 1) + 1
-                diff = DeepDiff(old_doc, study, ignore_order=True).to_dict()
+            doc_hash = compute_hash(new_doc)
 
-                updated_doc = {
-                    "$set": {
-                        **study,
-                        "version": version,
-                        "timestamp": datetime.datetime.utcnow(),
-                        "hash": new_hash,
-                        "diff": diff,
-                    }
+            update_doc = {
+                "$set": {
+                    **new_doc,
+                    "version": version,
+                    "timestamp": datetime.utcnow(),
+                    "hash": doc_hash,
+                    "diff": clean_diff,
+                    "diff_log": diff_log
                 }
+            }
 
-                updates.append(UpdateOne(
-                    {"StudyID": study_id, "version": version},
-                    updated_doc,
-                    upsert=True
-                ))
-
-                logs.append(f"🔄 Updated {study_id} to version {version}")
-            else:
-                logs.append(f"⏭️ Skipped {study_id} (no changes)")
+            updates.append(
+                UpdateOne({"StudyID": new_doc["StudyID"], "version": version}, update_doc, upsert=True)
+            )
+            logs.append(f"Updated {new_doc['StudyID']} to version {version}")
         else:
-            study["version"] = 1
-            study["timestamp"] = datetime.datetime.utcnow()
-            study["hash"] = new_hash
-            inserts.append(study)
-            logs.append(f"🆕 Inserted new study {study_id}")
+            new_doc["version"] = 1
+            new_doc["timestamp"] = datetime.utcnow()
+            new_doc["hash"] = compute_hash(new_doc)
+            new_doc["diff"] = {}
+            new_doc["diff_log"] = json.dumps({})
+            inserts.append(new_doc)
+            logs.append(f"Inserted new study {new_doc['StudyID']} version 1")
 
     if inserts:
         collection.insert_many(inserts)
     if updates:
         collection.bulk_write(updates)
 
-    st.success("✅ Sync complete")
-    st.code("\n".join(logs))
+    st.success("Upload completed")
+    st.write("Logs:", logs)
 
-# --- Rollback Interface ---
+st.subheader("📜 Study Version Viewer")
+study_ids = collection.distinct("StudyID")
+selected = st.selectbox("Select StudyID", study_ids)
 
-with st.expander("⏪ Rollback to a previous version"):
-    rollback_id = st.text_input("StudyID for rollback")
-    rollback_ver = st.number_input("Version to rollback to", min_value=1, step=1)
+if selected:
+    versions = list(collection.find({"StudyID": selected}).sort("version", 1))
+    st.dataframe(pd.DataFrame(versions).drop(columns=["_id"]))
+
+    export_format = st.radio("Download format", ["CSV", "JSON"])
+    if st.button("Download Versions"):
+        export_df = pd.DataFrame(versions).drop(columns=["_id"])
+        if export_format == "CSV":
+            st.download_button("Download CSV", export_df.to_csv(index=False), file_name=f"{selected}_versions.csv")
+        else:
+            st.download_button("Download JSON", export_df.to_json(orient="records", indent=2), file_name=f"{selected}_versions.json")
+
+    rollback_version = st.number_input("Rollback to version", min_value=1, step=1)
     if st.button("Rollback"):
-        rollback_study(rollback_id, rollback_ver)
+        rollback_to_version(selected, rollback_version)
