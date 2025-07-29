@@ -7,7 +7,7 @@ import datetime
 import json
 
 # --- Mongo Connection ---
-client = MongoClient(st.secrets["mongo"]["uri"])
+client = MongoClient(st.secrets["MONGO_URI"])
 db = client["StudyDB"]
 collection = db["Studycollection"]
 
