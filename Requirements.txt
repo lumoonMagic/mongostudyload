@@ -1,0 +1,11 @@
+
+---
+
+## ✅ `requirements.txt`
+
+```text
+streamlit
+pandas
+pymongo
+openpyxl
+deepdiff
