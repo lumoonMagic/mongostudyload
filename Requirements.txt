@@ -1,7 +1,3 @@
-
-## ✅ `requirements.txt`
-
-```text
 streamlit
 pandas
 pymongo
