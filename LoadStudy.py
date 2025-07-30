@@ -53,66 +53,67 @@ st.title("📊 Study Loader with Version Control")
 
 uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 upload_preview_df = None
+upload_triggered = False
+
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
     upload_preview_df = df.copy()
     st.subheader("Preview Data from Uploaded Excel")
-    st.dataframe(upload_preview_df)
+    st.dataframe(upload_preview_df.astype(str))
+    upload_triggered = st.button("Save to Database")
 
-    if st.button("Save to Database"):
-        updates, inserts = [], []
-        logs = []
+if upload_triggered:
+    updates, inserts = [], []
+    logs = []
 
-        for _, row in df.iterrows():
-            new_doc = row.dropna().to_dict()
+    for _, row in df.iterrows():
+        new_doc = row.dropna().to_dict()
 
-            # Ensure datetime fields are converted
-            for k in ["StartDate", "EndDate"]:
-                if k in new_doc and not isinstance(new_doc[k], datetime):
-                    new_doc[k] = pd.to_datetime(new_doc[k]).to_pydatetime()
+        for k in ["StartDate", "EndDate"]:
+            if k in new_doc and not isinstance(new_doc[k], datetime):
+                new_doc[k] = pd.to_datetime(new_doc[k]).to_pydatetime()
 
-            new_doc["StudyID"] = str(new_doc["StudyID"]).strip()
-            existing_doc = collection.find_one({"StudyID": new_doc["StudyID"]}, sort=[("version", -1)])
+        new_doc["StudyID"] = str(new_doc["StudyID"]).strip()
+        existing_doc = collection.find_one({"StudyID": new_doc["StudyID"]}, sort=[("version", -1)])
 
-            if existing_doc:
-                version = existing_doc["version"] + 1
-                raw_diff = DeepDiff(existing_doc, new_doc, ignore_order=True)
-                clean_diff = json.loads(raw_diff.to_json())
-                diff_log = raw_diff.to_json()
+        if existing_doc:
+            version = existing_doc["version"] + 1
+            raw_diff = DeepDiff(existing_doc, new_doc, ignore_order=True)
+            clean_diff = json.loads(raw_diff.to_json())
+            diff_log = raw_diff.to_json()
+            doc_hash = compute_hash(new_doc)
 
-                doc_hash = compute_hash(new_doc)
-
-                update_doc = {
-                    "$set": {
-                        **new_doc,
-                        "version": version,
-                        "timestamp": datetime.utcnow(),
-                        "hash": doc_hash,
-                        "diff": clean_diff,
-                        "diff_log": diff_log
-                    }
+            update_doc = {
+                "$set": {
+                    **new_doc,
+                    "version": version,
+                    "timestamp": datetime.utcnow(),
+                    "hash": doc_hash,
+                    "diff": clean_diff,
+                    "diff_log": diff_log
                 }
+            }
 
-                updates.append(
-                    UpdateOne({"StudyID": new_doc["StudyID"], "version": version}, update_doc, upsert=True)
-                )
-                logs.append(f"Updated {new_doc['StudyID']} to version {version}")
-            else:
-                new_doc["version"] = 1
-                new_doc["timestamp"] = datetime.utcnow()
-                new_doc["hash"] = compute_hash(new_doc)
-                new_doc["diff"] = {}
-                new_doc["diff_log"] = json.dumps({})
-                inserts.append(new_doc)
-                logs.append(f"Inserted new study {new_doc['StudyID']} version 1")
+            updates.append(
+                UpdateOne({"StudyID": new_doc["StudyID"], "version": version}, update_doc, upsert=True)
+            )
+            logs.append(f"Updated {new_doc['StudyID']} to version {version}")
+        else:
+            new_doc["version"] = 1
+            new_doc["timestamp"] = datetime.utcnow()
+            new_doc["hash"] = compute_hash(new_doc)
+            new_doc["diff"] = {}
+            new_doc["diff_log"] = json.dumps({})
+            inserts.append(new_doc)
+            logs.append(f"Inserted new study {new_doc['StudyID']} version 1")
 
-        if inserts:
-            collection.insert_many(inserts)
-        if updates:
-            collection.bulk_write(updates)
+    if inserts:
+        collection.insert_many(inserts)
+    if updates:
+        collection.bulk_write(updates)
 
-        st.success("Upload completed")
-        st.write("Logs:", logs)
+    st.success("Upload completed")
+    st.write("Logs:", logs)
 
 st.subheader("📜 Study Version Viewer")
 study_ids = collection.distinct("StudyID")
@@ -152,7 +153,6 @@ if selected:
             doc2_clean = {k: v for k, v in doc2.items() if k not in ["_id", "diff", "diff_log", "timestamp", "hash"]}
             diff = DeepDiff(doc1_clean, doc2_clean, ignore_order=True)
 
-            # Display comparison table with highlighting
             compare_rows = []
             for key in set(doc1_clean.keys()).union(set(doc2_clean.keys())):
                 v1_val = doc1_clean.get(key, "")
@@ -165,10 +165,9 @@ if selected:
                     "Changed?": "🔁" if changed else ""
                 })
 
-            compare_df = pd.DataFrame(compare_rows)
+            compare_df = pd.DataFrame(compare_rows).astype(str)
             st.dataframe(compare_df.style.applymap(lambda val: 'background-color: #fff3cd' if val == '🔁' else ''))
 
-            # --- Download comparison ---
             compare_format = st.radio("Download comparison as", ["CSV", "JSON"], key="compare_format")
             if compare_format == "CSV":
                 st.download_button("Download Comparison CSV", compare_df.to_csv(index=False), file_name=f"comparison_v{v1}_v{v2}.csv")
