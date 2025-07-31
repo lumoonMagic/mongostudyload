@@ -11,13 +11,14 @@ import streamlit.components.v1 as components
 client = MongoClient(st.secrets["MONGO_URI"])
 db = client["StudyDB"]
 collection = db["Studycollection"]
+archive_collection = db["Studycollection_Archived"]
 
 # --- Helpers ---
 def compute_hash(doc):
     doc_str = json.dumps(doc, sort_keys=True, default=str)
     return hashlib.md5(doc_str.encode()).hexdigest()
 
-def get_latest_versions():
+def get_latest_versions(coll):
     pipeline = [
         {"$sort": {"version": -1}},
         {
@@ -28,12 +29,7 @@ def get_latest_versions():
         },
         {"$replaceRoot": {"newRoot": "$doc"}}
     ]
-    return list(collection.aggregate(pipeline))
-
-def save_version(doc):
-    version_doc = doc.copy()
-    version_doc.pop("_id", None)
-    collection.insert_one(version_doc)
+    return list(coll.aggregate(pipeline))
 
 def rollback_to_version(study_id, version):
     target = collection.find_one({"StudyID": study_id, "version": version})
@@ -48,139 +44,177 @@ def rollback_to_version(study_id, version):
         collection.insert_one(target)
         st.success(f"Rolled back {study_id} to version {version} as version {new_version}.")
 
+def archive_studies(study_ids):
+    for study_id in study_ids:
+        all_versions = list(collection.find({"StudyID": study_id}))
+        for doc in all_versions:
+            doc.pop("_id", None)
+            doc["archived_at"] = datetime.utcnow()
+            archive_collection.insert_one(doc)
+        collection.delete_many({"StudyID": study_id})
+        st.success(f"Archived study {study_id}")
+
+def unarchive_study(study_id):
+    all_versions = list(archive_collection.find({"StudyID": study_id}))
+    for doc in all_versions:
+        doc.pop("_id", None)
+        collection.insert_one(doc)
+    archive_collection.delete_many({"StudyID": study_id})
+    st.success(f"Unarchived study {study_id}")
+
 # --- Streamlit App ---
 st.title("📊 Study Loader with Version Control")
 
-uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
-upload_preview_df = None
-upload_triggered = False
+tabs = st.tabs(["📥 Upload & Manage", "📜 View Active Studies", "🗄️ Archived Studies"])
 
-if uploaded_file:
-    df = pd.read_excel(uploaded_file)
-    df = df.dropna(how='all')
-    upload_preview_df = df.copy()
+with tabs[0]:
+    uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
+    upload_preview_df = None
+    upload_triggered = False
 
-    st.subheader("Preview Data from Uploaded Excel")
-    search_term = st.text_input("Search Studies")
-    filtered_df = upload_preview_df[upload_preview_df.astype(str).apply(lambda row: row.str.contains(search_term, case=False).any(), axis=1)] if search_term else upload_preview_df
+    if uploaded_file:
+        df = pd.read_excel(uploaded_file)
+        df = df.dropna(how='all')
+        upload_preview_df = df.copy()
 
-    edited_df = st.data_editor(filtered_df.astype(str), num_rows="dynamic")
-    upload_triggered = st.button("Save to Database")
+        st.subheader("Preview Data from Uploaded Excel")
+        search_term = st.text_input("Search Studies")
+        filtered_df = upload_preview_df[upload_preview_df.astype(str).apply(lambda row: row.str.contains(search_term, case=False).any(), axis=1)] if search_term else upload_preview_df
 
-    if upload_triggered:
-        updates, inserts = [], []
-        logs = []
+        edited_df = st.data_editor(filtered_df.astype(str), num_rows="dynamic")
+        upload_triggered = st.button("Save to Database")
 
-        for _, row in edited_df.iterrows():
-            new_doc = row.dropna().to_dict()
+        if upload_triggered:
+            updates, inserts = [], []
+            logs = []
 
-            for k in ["StartDate", "EndDate"]:
-                if k in new_doc and not isinstance(new_doc[k], datetime):
-                    try:
-                        new_doc[k] = pd.to_datetime(new_doc[k]).to_pydatetime()
-                    except:
-                        st.warning(f"Invalid date for {k} in StudyID {new_doc.get('StudyID', 'Unknown')}")
-                        continue
+            for _, row in edited_df.iterrows():
+                new_doc = row.dropna().to_dict()
 
-            new_doc["StudyID"] = str(new_doc["StudyID"]).strip()
-            existing_doc = collection.find_one({"StudyID": new_doc["StudyID"]}, sort=[("version", -1)])
+                for k in ["StartDate", "EndDate"]:
+                    if k in new_doc and not isinstance(new_doc[k], datetime):
+                        try:
+                            new_doc[k] = pd.to_datetime(new_doc[k]).to_pydatetime()
+                        except:
+                            st.warning(f"Invalid date for {k} in StudyID {new_doc.get('StudyID', 'Unknown')}")
+                            continue
 
-            new_doc["source_filename"] = uploaded_file.name
+                new_doc["StudyID"] = str(new_doc["StudyID"]).strip()
+                existing_doc = collection.find_one({"StudyID": new_doc["StudyID"]}, sort=[("version", -1)])
 
-            if existing_doc:
-                version = existing_doc["version"] + 1
-                raw_diff = DeepDiff(existing_doc, new_doc, ignore_order=True)
-                clean_diff = json.loads(raw_diff.to_json())
-                diff_log = raw_diff.to_json()
-                doc_hash = compute_hash(new_doc)
+                new_doc["source_filename"] = uploaded_file.name
 
-                update_doc = {
-                    "$set": {
-                        **new_doc,
-                        "version": version,
-                        "timestamp": datetime.utcnow(),
-                        "hash": doc_hash,
-                        "diff": clean_diff,
-                        "diff_log": diff_log
+                if existing_doc:
+                    version = existing_doc["version"] + 1
+                    raw_diff = DeepDiff(existing_doc, new_doc, ignore_order=True)
+                    clean_diff = json.loads(raw_diff.to_json())
+                    diff_log = raw_diff.to_json()
+                    doc_hash = compute_hash(new_doc)
+
+                    update_doc = {
+                        "$set": {
+                            **new_doc,
+                            "version": version,
+                            "timestamp": datetime.utcnow(),
+                            "hash": doc_hash,
+                            "diff": clean_diff,
+                            "diff_log": diff_log
+                        }
                     }
-                }
 
-                updates.append(
-                    UpdateOne({"StudyID": new_doc["StudyID"], "version": version}, update_doc, upsert=True)
-                )
-                logs.append(f"Updated {new_doc['StudyID']} to version {version}")
+                    updates.append(
+                        UpdateOne({"StudyID": new_doc["StudyID"], "version": version}, update_doc, upsert=True)
+                    )
+                    logs.append(f"Updated {new_doc['StudyID']} to version {version}")
+                else:
+                    new_doc["version"] = 1
+                    new_doc["timestamp"] = datetime.utcnow()
+                    new_doc["hash"] = compute_hash(new_doc)
+                    new_doc["diff"] = {}
+                    new_doc["diff_log"] = json.dumps({})
+                    inserts.append(new_doc)
+                    logs.append(f"Inserted new study {new_doc['StudyID']} version 1")
+
+            if inserts:
+                collection.insert_many(inserts)
+            if updates:
+                collection.bulk_write(updates)
+
+            st.success("Upload completed")
+            st.write("Logs:", logs)
+
+with tabs[1]:
+    st.subheader("📜 Study Version Viewer")
+    study_ids = collection.distinct("StudyID")
+    selected = st.selectbox("Select StudyID", study_ids)
+
+    if selected:
+        versions = list(collection.find({"StudyID": selected}).sort("version", 1))
+        st.dataframe(pd.DataFrame(versions).drop(columns=["_id"]))
+
+        export_format = st.radio("Download format", ["CSV", "JSON"])
+        if st.button("Download Versions"):
+            export_df = pd.DataFrame(versions).drop(columns=["_id"])
+            if export_format == "CSV":
+                st.download_button("Download CSV", export_df.to_csv(index=False), file_name=f"{selected}_versions.csv")
             else:
-                new_doc["version"] = 1
-                new_doc["timestamp"] = datetime.utcnow()
-                new_doc["hash"] = compute_hash(new_doc)
-                new_doc["diff"] = {}
-                new_doc["diff_log"] = json.dumps({})
-                inserts.append(new_doc)
-                logs.append(f"Inserted new study {new_doc['StudyID']} version 1")
+                st.download_button("Download JSON", export_df.to_json(orient="records", indent=2), file_name=f"{selected}_versions.json")
 
-        if inserts:
-            collection.insert_many(inserts)
-        if updates:
-            collection.bulk_write(updates)
+        rollback_version = st.number_input("Rollback to version", min_value=1, step=1)
+        if st.button("Rollback"):
+            rollback_to_version(selected, rollback_version)
 
-        st.success("Upload completed")
-        st.write("Logs:", logs)
+        st.subheader("🔍 Compare Two Versions")
+        version_nums = [v["version"] for v in versions]
+        col1, col2 = st.columns(2)
+        with col1:
+            v1 = st.selectbox("From Version", version_nums, key="from_version")
+        with col2:
+            v2 = st.selectbox("To Version", version_nums, index=len(version_nums)-1, key="to_version")
 
-st.subheader("📜 Study Version Viewer")
-study_ids = collection.distinct("StudyID")
-selected = st.selectbox("Select StudyID", study_ids)
+        if v1 and v2 and v1 != v2:
+            doc1 = next((v for v in versions if v["version"] == v1), None)
+            doc2 = next((v for v in versions if v["version"] == v2), None)
 
-if selected:
-    versions = list(collection.find({"StudyID": selected}).sort("version", 1))
-    st.dataframe(pd.DataFrame(versions).drop(columns=["_id"]))
+            if doc1 and doc2:
+                doc1_clean = {k: v for k, v in doc1.items() if k not in ["_id", "diff", "diff_log", "timestamp", "hash"]}
+                doc2_clean = {k: v for k, v in doc2.items() if k not in ["_id", "diff", "diff_log", "timestamp", "hash"]}
+                diff = DeepDiff(doc1_clean, doc2_clean, ignore_order=True)
 
-    export_format = st.radio("Download format", ["CSV", "JSON"])
-    if st.button("Download Versions"):
-        export_df = pd.DataFrame(versions).drop(columns=["_id"])
-        if export_format == "CSV":
-            st.download_button("Download CSV", export_df.to_csv(index=False), file_name=f"{selected}_versions.csv")
-        else:
-            st.download_button("Download JSON", export_df.to_json(orient="records", indent=2), file_name=f"{selected}_versions.json")
+                compare_rows = []
+                for key in set(doc1_clean.keys()).union(set(doc2_clean.keys())):
+                    v1_val = doc1_clean.get(key, "")
+                    v2_val = doc2_clean.get(key, "")
+                    changed = v1_val != v2_val
+                    compare_rows.append({
+                        "Field": key,
+                        f"Version {v1}": v1_val,
+                        f"Version {v2}": v2_val,
+                        "Changed?": "🔁" if changed else ""
+                    })
 
-    rollback_version = st.number_input("Rollback to version", min_value=1, step=1)
-    if st.button("Rollback"):
-        rollback_to_version(selected, rollback_version)
+                compare_df = pd.DataFrame(compare_rows).astype(str)
+                st.dataframe(compare_df.style.applymap(lambda val: 'background-color: #fff3cd' if val == '🔁' else ''))
 
-    # --- Version Comparison ---
-    st.subheader("🔍 Compare Two Versions")
-    version_nums = [v["version"] for v in versions]
-    col1, col2 = st.columns(2)
-    with col1:
-        v1 = st.selectbox("From Version", version_nums, key="from_version")
-    with col2:
-        v2 = st.selectbox("To Version", version_nums, index=len(version_nums)-1, key="to_version")
+                compare_format = st.radio("Download comparison as", ["CSV", "JSON"], key="compare_format")
+                if compare_format == "CSV":
+                    st.download_button("Download Comparison CSV", compare_df.to_csv(index=False), file_name=f"comparison_v{v1}_v{v2}.csv")
+                else:
+                    st.download_button("Download Comparison JSON", compare_df.to_json(orient="records", indent=2), file_name=f"comparison_v{v1}_v{v2}.json")
 
-    if v1 and v2 and v1 != v2:
-        doc1 = next((v for v in versions if v["version"] == v1), None)
-        doc2 = next((v for v in versions if v["version"] == v2), None)
+    st.subheader("🗃️ Archive Studies")
+    to_archive = st.multiselect("Select Studies to Archive", study_ids)
+    if st.button("Archive Selected") and to_archive:
+        archive_studies(to_archive)
 
-        if doc1 and doc2:
-            doc1_clean = {k: v for k, v in doc1.items() if k not in ["_id", "diff", "diff_log", "timestamp", "hash"]}
-            doc2_clean = {k: v for k, v in doc2.items() if k not in ["_id", "diff", "diff_log", "timestamp", "hash"]}
-            diff = DeepDiff(doc1_clean, doc2_clean, ignore_order=True)
+with tabs[2]:
+    st.subheader("🗄️ Archived Study Viewer")
+    archived_ids = archive_collection.distinct("StudyID")
+    selected_archived = st.selectbox("Select Archived StudyID", archived_ids)
 
-            compare_rows = []
-            for key in set(doc1_clean.keys()).union(set(doc2_clean.keys())):
-                v1_val = doc1_clean.get(key, "")
-                v2_val = doc2_clean.get(key, "")
-                changed = v1_val != v2_val
-                compare_rows.append({
-                    "Field": key,
-                    f"Version {v1}": v1_val,
-                    f"Version {v2}": v2_val,
-                    "Changed?": "🔁" if changed else ""
-                })
+    if selected_archived:
+        versions = list(archive_collection.find({"StudyID": selected_archived}).sort("version", 1))
+        st.dataframe(pd.DataFrame(versions).drop(columns=["_id"]))
 
-            compare_df = pd.DataFrame(compare_rows).astype(str)
-            st.dataframe(compare_df.style.applymap(lambda val: 'background-color: #fff3cd' if val == '🔁' else ''))
-
-            compare_format = st.radio("Download comparison as", ["CSV", "JSON"], key="compare_format")
-            if compare_format == "CSV":
-                st.download_button("Download Comparison CSV", compare_df.to_csv(index=False), file_name=f"comparison_v{v1}_v{v2}.csv")
-            else:
-                st.download_button("Download Comparison JSON", compare_df.to_json(orient="records", indent=2), file_name=f"comparison_v{v1}_v{v2}.json")
+        if st.button("Unarchive Study"):
+            unarchive_study(selected_archived)
