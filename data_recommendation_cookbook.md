@@ -40,7 +40,7 @@ The entire process is managed by an **Orchestration Service** which ensures the 
 
 ```mermaid
 graph TD
-    A[DE Request (HLQ)] -->|User Input| B(Orchestration Service)
+    A[DE Request HLQ] -->|User Input| B(Orchestration Service)
     B -->|1. Generate Search Query| C[Graph RAG Service: Cypher Generation]
     C -->|2. Execute Cypher| D[Neo4j/Vector DB]
     D -->|3. Return Filtered JSON| E(Orchestration Service)
